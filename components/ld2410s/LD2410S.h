@@ -15,6 +15,7 @@
 namespace esphome {
     namespace ld2410s {
         // Short reporting format
+        static const size_t RX_BUFFER_SIZE = 64;
         static const uint16_t DATA_FRAME_HEADER = 0x6E;
         static const uint16_t DATA_FRAME_FOOTER = 0x62;
 
@@ -123,6 +124,8 @@ namespace esphome {
             std::vector<LD2410SListener*> listeners{};
             Config current_config;
             bool cmd_active{ false };
+            uint8_t rx_buffer[RX_BUFFER_SIZE];
+            size_t rx_pos{ 0 };
 #ifdef USE_NUMBER
             number::Number* max_distance_number{ nullptr };
             number::Number* min_distance_number{ nullptr };
@@ -145,6 +148,8 @@ namespace esphome {
             CmdFrameT prepare_read_fw_cmd();
             void send_command(CmdFrameT cmd_frame);
             PackageType read_line(uint8_t data, uint8_t* buffer, size_t pos);
+            void resync_buffer();
+            bool find_frame_start(const uint8_t* buffer, size_t footer_start, uint32_t header, size_t* start);
             bool process_cmd_ack_package(uint8_t* buffer, int len);
             void process_data_package(PackageType type, uint8_t* buffer, size_t pos);
             int read_int(uint8_t* buffer, size_t pos, size_t len) {

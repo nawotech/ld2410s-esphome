@@ -1,6 +1,8 @@
 #include "esphome/core/log.h"
 #include "LD2410S.h"
 
+#include <cstring>
+
 namespace esphome
 {
     namespace ld2410s
@@ -18,15 +20,32 @@ namespace esphome
         }
 
         void LD2410S::loop() {
-            if (!this->cmd_active) {
-                static uint8_t buffer[64];
-                static size_t pos = 0;
-                while (available()) {
-                    PackageType type = this->read_line(read(), buffer, pos++);
-                    if (type == PackageType::SHORT_DATA || type == PackageType::TRESHOLD) {
-                        this->process_data_package(type, buffer, pos);
-                        pos = 0;
-                    }
+            if (this->cmd_active) {
+                return;
+            }
+            while (available()) {
+                if (this->rx_pos >= RX_BUFFER_SIZE) {
+                    // No frame was recognized while the buffer filled up. Drop everything before the
+                    // next plausible frame start instead of writing past the end of the buffer.
+                    this->resync_buffer();
+                }
+                const size_t match_pos = this->rx_pos;
+                PackageType type = this->read_line(read(), this->rx_buffer, match_pos);
+                this->rx_pos++;
+                switch (type) {
+                case PackageType::SHORT_DATA:
+                case PackageType::TRESHOLD:
+                    this->process_data_package(type, this->rx_buffer, match_pos);
+                    this->rx_pos = 0;
+                    break;
+                case PackageType::ACK:
+                    // Acks are only consumed by send_command(); one seen here belongs to a command we
+                    // are no longer waiting for, so drop it and restart with an empty buffer.
+                    ESP_LOGV(TAG, "Dropping unsolicited ack package");
+                    this->rx_pos = 0;
+                    break;
+                default:
+                    break;
                 }
             }
         }
@@ -202,12 +221,17 @@ namespace esphome
                 bool reply = false;
 
                 while (!reply) {
-                    uint8_t ack_buffer[64];
+                    uint8_t ack_buffer[RX_BUFFER_SIZE];
                     size_t last_pos = 0;
                     while (available()) {
-                        PackageType type = this->read_line(read(), ack_buffer, last_pos++);
+                        if (last_pos >= RX_BUFFER_SIZE) {
+                            last_pos = 0;
+                        }
+                        const size_t match_pos = last_pos;
+                        PackageType type = this->read_line(read(), ack_buffer, match_pos);
+                        last_pos++;
                         if (type == PackageType::ACK) {
-                            reply = this->process_cmd_ack_package(ack_buffer, last_pos + 1);
+                            reply = this->process_cmd_ack_package(ack_buffer, match_pos + 1);
                             last_pos = 0;
                         }
                     }
@@ -228,20 +252,59 @@ namespace esphome
         }
 
         PackageType LD2410S::read_line(uint8_t data, uint8_t* buffer, size_t pos) {
+            if (pos >= RX_BUFFER_SIZE) {
+                // Caller failed to resync; never write past the end of the buffer.
+                return PackageType::UNKNOWN;
+            }
             buffer[pos] = data;
 
-            if (pos > 4) {
+            if (pos >= 4) {
                 if (memcmp(&buffer[pos - 3], &CMD_FRAME_FOOTER, sizeof(CMD_FRAME_FOOTER)) == 0) {
                     return PackageType::ACK;
                 }
                 else if (buffer[pos] == DATA_FRAME_FOOTER && buffer[pos - 4] == DATA_FRAME_HEADER) {
                     return PackageType::SHORT_DATA;
                 }
-                else if (memcmp(&buffer[pos - 3], &THRESHOLD_FOOTER, sizeof(THRESHOLD_FOOTER)) == 0) {
+                else if (memcmp(&buffer[pos - 3], &THRESHOLD_FOOTER, sizeof(THRESHOLD_FOOTER)) == 0
+                    && this->find_frame_start(buffer, pos - 3, THRESHOLD_HEADER, nullptr)) {
                     return PackageType::TRESHOLD;
                 }
             }
             return PackageType::UNKNOWN;
+        }
+
+        bool LD2410S::find_frame_start(const uint8_t* buffer, size_t footer_start, uint32_t header, size_t* start) {
+            bool found = false;
+            size_t candidate = 0;
+            for (size_t i = 0; i + sizeof(header) <= footer_start; i++) {
+                if (memcmp(&buffer[i], &header, sizeof(header)) == 0) {
+                    candidate = i;
+                    found = true;
+                }
+            }
+            if (found && start != nullptr) {
+                *start = candidate;
+            }
+            return found;
+        }
+
+        void LD2410S::resync_buffer() {
+            const uint8_t data_header = static_cast<uint8_t>(DATA_FRAME_HEADER);
+            const uint8_t cmd_header = static_cast<uint8_t>(CMD_FRAME_HEADER & 0xFF);
+            const uint8_t threshold_header = static_cast<uint8_t>(THRESHOLD_HEADER & 0xFF);
+
+            for (size_t i = 1; i < this->rx_pos; i++) {
+                const uint8_t byte = this->rx_buffer[i];
+                if (byte == data_header || byte == cmd_header || byte == threshold_header) {
+                    const size_t remaining = this->rx_pos - i;
+                    memmove(this->rx_buffer, &this->rx_buffer[i], remaining);
+                    this->rx_pos = remaining;
+                    ESP_LOGV(TAG, "Resynced RX buffer, discarded %u byte(s)", static_cast<unsigned>(i));
+                    return;
+                }
+            }
+            ESP_LOGV(TAG, "Resynced RX buffer, discarded %u byte(s)", static_cast<unsigned>(this->rx_pos));
+            this->rx_pos = 0;
         }
 
         void LD2410S::process_config_read_ack(uint8_t* data) {
@@ -317,6 +380,7 @@ namespace esphome
         void LD2410S::process_short_data_package(uint8_t* data) {
             const bool presenceState = data[0] > 1;
             int distance = this->two_byte_to_int(data[1], data[2]);
+            ESP_LOGV(TAG, "Short data decoded: state=%02X presence=%s distance=%d cm", data[0], YESNO(presenceState), distance);
             for (auto& listener : this->listeners) {
                 listener->on_presence(presenceState);
                 listener->on_distance(distance);
@@ -338,13 +402,33 @@ namespace esphome
         }
 
         void LD2410S::process_data_package(PackageType type, uint8_t* buffer, size_t pos) {
+            // `pos` is the index of the byte that completed the frame, i.e. where read_line() matched
+            // the footer. Every field has to be read relative to that position, never from a fixed
+            // offset, otherwise stale bytes of earlier/unrecognized data get decoded as sensor values.
             switch (type) {
-            case PackageType::SHORT_DATA:
-                this->process_short_data_package(&buffer[1]);
+            case PackageType::SHORT_DATA: {
+                // read_line() matched buffer[pos - 4] == DATA_FRAME_HEADER and buffer[pos] ==
+                // DATA_FRAME_FOOTER, so the payload is state, distance low, distance high at pos - 3.
+                const uint8_t* frame = &buffer[pos - 4];
+                ESP_LOGV(TAG, "Short data frame: %02X:%02X:%02X:%02X:%02X", frame[0], frame[1], frame[2], frame[3], frame[4]);
+                this->process_short_data_package(&buffer[pos - 3]);
                 break;
-            case PackageType::TRESHOLD:
-                this->process_threshold_package(&buffer[4]);
+            }
+            case PackageType::TRESHOLD: {
+                // The footer occupies pos - 3 .. pos; the payload starts 4 bytes after the header.
+                size_t start = 0;
+                if (!this->find_frame_start(buffer, pos - 3, THRESHOLD_HEADER, &start)) {
+                    ESP_LOGW(TAG, "Threshold footer without a matching header, dropping frame");
+                    break;
+                }
+                if (start + 8 > pos) {
+                    ESP_LOGW(TAG, "Threshold frame too short, dropping frame");
+                    break;
+                }
+                ESP_LOGV(TAG, "Threshold frame at offset %u, length %u", static_cast<unsigned>(start), static_cast<unsigned>(pos - start + 1));
+                this->process_threshold_package(&buffer[start + 4]);
                 break;
+            }
             default:
                 ESP_LOGD(TAG, "Unexpected package type");
                 break;
@@ -358,28 +442,39 @@ namespace esphome
 
         CmdAckT LD2410S::parse_ack(uint8_t* buffer, size_t length) {
             CmdAckT result;
-            size_t start = -1;
-            for (size_t i = 0; i < length; i++) {
+            bool found = false;
+            size_t start = 0;
+            for (size_t i = 0; i + sizeof(CMD_FRAME_HEADER) <= length; i++) {
                 if (memcmp(&buffer[i], &CMD_FRAME_HEADER, sizeof(CMD_FRAME_HEADER)) == 0) {
                     start = i;
+                    found = true;
                     break;
                 }
             }
-            if (start == -1) {
+            if (!found) {
                 ESP_LOGE(TAG, "Can't find cmd header");
                 result.result = false;
                 return result;
             }
+            if (start + 10 > length) {
+                ESP_LOGE(TAG, "Truncated ack package");
+                result.result = false;
+                return result;
+            }
             int data_length = this->two_byte_to_int(buffer[start + 4], buffer[start + 5]);
+            if (data_length > static_cast<int>(sizeof(result.data))) {
+                data_length = static_cast<int>(sizeof(result.data));
+            }
+            if (start + 10 + static_cast<size_t>(data_length) > length) {
+                data_length = static_cast<int>(length) - static_cast<int>(start) - 10;
+            }
             result.length = data_length;
             int command_word = this->two_byte_to_int(buffer[start + 6], buffer[start + 7]);
             result.command = command_word;
             bool ack = buffer[start + 8] == 0x00 && buffer[start + 9] == 0x00;
             result.result = ack;
-            // memcpy(&result.data, &buffer[start + 10], sizeof(uint8_t) * result.length);
-            for (size_t idx = 0; idx < result.length; idx++) {
-                memcpy(&result.data[idx], &buffer[idx + 10], sizeof(buffer[idx + 10]));
-            }
+            // The payload starts 10 bytes after the header, wherever the header was found.
+            memcpy(result.data, &buffer[start + 10], result.length);
             return result;
         }
     }
