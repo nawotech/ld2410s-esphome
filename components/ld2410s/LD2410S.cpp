@@ -10,6 +10,19 @@ namespace esphome
 
         static const char* TAG = "ld2410s";
 
+        static std::string format_bytes(const uint8_t* data, size_t length) {
+            std::string out;
+            char byte[4];
+            for (size_t i = 0; i < length; i++) {
+                snprintf(byte, sizeof(byte), "%02X", data[i]);
+                if (i != 0) {
+                    out += ':';
+                }
+                out += byte;
+            }
+            return out;
+        }
+
         void LD2410S::setup() {
             this->set_config_mode(true);
             CmdFrameT read_fw_cmd = this->prepare_read_fw_cmd();
@@ -324,7 +337,16 @@ namespace esphome
 #ifdef USE_SELECT
             this->response_speed_select->publish_state(resp_speed == 5 ? RESPONSE_SPEED_NORMAL : RESPONSE_SPEED_FAST);
 #endif
-            memcpy(&this->new_config, &this->current_config, sizeof(this->current_config));
+            // Remember what the sensor actually reports, so that new_config starts from the
+            // device's real settings. Without this, current_config stayed all-zero and
+            // apply_config() wrote a zeroed configuration back to the sensor.
+            this->current_config.max_dist = max_dist;
+            this->current_config.min_dist = min_dist;
+            this->current_config.delay = delay;
+            this->current_config.status_freq = status_resp_freq;
+            this->current_config.dist_freq = dist_resp_freq;
+            this->current_config.resp_speed = resp_speed;
+            this->new_config = this->current_config;
             ESP_LOGD(TAG, "Read config replay: max_dist=%d, min_dist=%d, delay=%d, status_resp_freq=%d, dist_resp_freq=%d, resp_speed=%d", max_dist, min_dist, delay, status_resp_freq, dist_resp_freq, resp_speed);
         }
 
@@ -340,7 +362,10 @@ namespace esphome
         }
 
         bool LD2410S::process_cmd_ack_package(uint8_t* buffer, int len) {
+            ESP_LOGV(TAG, "Ack buffer (%d bytes): %s", len, format_bytes(buffer, static_cast<size_t>(len)).c_str());
             CmdAckT ack = this->parse_ack(buffer, len);
+            ESP_LOGV(TAG, "Ack command=%04X result=%s payload=%s", ack.command, YESNO(ack.result),
+                format_bytes(ack.data, ack.length).c_str());
             int command_word = ack.command;
             bool result = ack.result;
             if (!result) {
