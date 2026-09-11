@@ -328,8 +328,8 @@ namespace esphome
             int dist_resp_freq = this->read_int(data, 16, 4);
             int resp_speed = this->read_int(data, 20, 4);
 #ifdef USE_NUMBER
-            this->max_distance_number->publish_state(max_dist);
-            this->min_distance_number->publish_state(min_dist);
+            this->max_distance_number->publish_state(max_dist * GATE_SIZE);
+            this->min_distance_number->publish_state(min_dist * GATE_SIZE);
             this->no_delay_number->publish_state(delay);
             this->status_reporting_freq_number->publish_state(status_resp_freq / 10);
             this->distance_reporting_freq_number->publish_state(dist_resp_freq / 10);
@@ -351,9 +351,10 @@ namespace esphome
         }
 
         void LD2410S::process_read_fw_ack(uint8_t* data) {
-            int major_v = static_cast<int>(data[0]);
-            int minor_v = static_cast<int>(data[1]);
-            int patch_v = static_cast<int>(data[2]);
+            // Each version field is two bytes, little endian.
+            int major_v = this->two_byte_to_int(data[0], data[1]);
+            int minor_v = this->two_byte_to_int(data[2], data[3]);
+            int patch_v = this->two_byte_to_int(data[4], data[5]);
             std::string version = "v" + std::to_string(major_v) + "." + std::to_string(minor_v) + "." + std::to_string(patch_v);
             for (auto& listener : this->listeners) {
                 listener->on_fw_version(version);
@@ -486,20 +487,41 @@ namespace esphome
                 result.result = false;
                 return result;
             }
+            // The length field counts the command word and everything after it, up to the footer.
             int data_length = this->two_byte_to_int(buffer[start + 4], buffer[start + 5]);
-            if (data_length > static_cast<int>(sizeof(result.data))) {
-                data_length = static_cast<int>(sizeof(result.data));
-            }
-            if (start + 10 + static_cast<size_t>(data_length) > length) {
-                data_length = static_cast<int>(length) - static_cast<int>(start) - 10;
-            }
-            result.length = data_length;
             int command_word = this->two_byte_to_int(buffer[start + 6], buffer[start + 7]);
             result.command = command_word;
-            bool ack = buffer[start + 8] == 0x00 && buffer[start + 9] == 0x00;
-            result.result = ack;
-            // The payload starts 10 bytes after the header, wherever the header was found.
-            memcpy(result.data, &buffer[start + 10], result.length);
+
+            // Every reply but the firmware version carries a two byte ack status after the
+            // command word; the firmware version reply goes straight into the version fields,
+            // so reading a status there sees the major version and reports a failed command.
+            size_t header_bytes = 4;
+            if (command_word == READ_FW_REPLAY) {
+                result.result = true;
+            }
+            else {
+                if (start + 10 > length) {
+                    ESP_LOGE(TAG, "Truncated ack package");
+                    result.result = false;
+                    return result;
+                }
+                result.result = buffer[start + 8] == 0x00 && buffer[start + 9] == 0x00;
+                header_bytes = 6;
+            }
+
+            const size_t payload_start = start + 4 + header_bytes;
+            int payload_length = data_length - static_cast<int>(header_bytes) + 2;
+            if (payload_length > static_cast<int>(sizeof(result.data))) {
+                payload_length = static_cast<int>(sizeof(result.data));
+            }
+            if (payload_start + static_cast<size_t>(payload_length) > length) {
+                payload_length = static_cast<int>(length) - static_cast<int>(payload_start);
+            }
+            if (payload_length < 0) {
+                payload_length = 0;
+            }
+            result.length = payload_length;
+            memcpy(result.data, &buffer[payload_start], result.length);
             return result;
         }
     }

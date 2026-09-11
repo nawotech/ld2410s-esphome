@@ -69,11 +69,13 @@ CONFIG_SCHEMA = cv.Schema(
 async def to_code(config):
     LD2410S_component = await cg.get_variable(config[CONF_LD2410S_ID])
     if max_distance_config := config.get(CONF_MAX_DISTANCE):
-        n = await number.new_number(max_distance_config, min_value=0, max_value=8.4, step=1)
+        # Distance gates are 0.7m deep and the sensor reaches 8m, so gate 12 is the last
+        # effective one. The value is in metres and converted to a gate before it is sent.
+        n = await number.new_number(max_distance_config, min_value=0.7, max_value=8.4, step=0.7)
         await cg.register_parented(n, config[CONF_LD2410S_ID])
         cg.add(LD2410S_component.set_max_distance_number(n))
     if min_distance_config := config.get(CONF_MIN_DISTANCE):
-        n = await number.new_number(min_distance_config, min_value=0, max_value=8.4, step=1)
+        n = await number.new_number(min_distance_config, min_value=0, max_value=8.4, step=0.7)
         await cg.register_parented(n, config[CONF_LD2410S_ID])
         cg.add(LD2410S_component.set_min_distance_number(n))
     if no_delay_config := config.get(CONF_NO_DELAY):

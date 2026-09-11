@@ -1,5 +1,7 @@
 #include "LD2410SNumber.h"
 
+#include <cmath>
+
 namespace esphome
 {
     namespace ld2410s
@@ -7,13 +9,15 @@ namespace esphome
         void LD2410SMaxDistanceNumber::control(float max_distance)
         {
             this->publish_state(max_distance);
-            this->parent_->new_config.max_dist = max_distance;
+            // The sensor takes a distance gate, not metres.
+            this->parent_->new_config.max_dist = static_cast<uint32_t>(lroundf(max_distance / GATE_SIZE));
         }
 
         void LD2410SMinDistanceNumber::control(float min_distance)
         {
             this->publish_state(min_distance);
-            this->parent_->new_config.min_dist = min_distance;
+            // The sensor takes a distance gate, not metres.
+            this->parent_->new_config.min_dist = static_cast<uint32_t>(lroundf(min_distance / GATE_SIZE));
         }
 
         void LD2410SDelayNumber::control(float no_delay)

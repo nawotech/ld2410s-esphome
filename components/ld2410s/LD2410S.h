@@ -48,6 +48,10 @@ namespace esphome {
         static const uint16_t READ_PARAMS_REPLAY = 0x0171;
         static const uint16_t READ_FW_REPLAY = 0x0100;
 
+        // A distance gate is 0.7m deep. The sensor's distance parameters are expressed in
+        // gates, while the controls exposed to the user are in metres.
+        static const float GATE_SIZE = 0.7f;
+
         static const std::string RESPONSE_SPEED_NORMAL = "Normal";
         static const std::string RESPONSE_SPEED_FAST = "Fast";
 
